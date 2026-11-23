@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https:; object-src 'none'; base-uri 'self'">
+<title>Listening stats</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="me" id="me"></div>
+    <nav id="nav" aria-label="Sections"></nav>
+    <div class="foot" id="foot"></div>
+  </aside>
+  <div class="content-col">
+    <div class="bar-top">
+      <div class="bar-top-inner">
+        <div class="search-wrap">
+          <input class="search" id="q" type="search" placeholder="Search artists, songs, albums" aria-label="Search artists, songs and albums">
+          <span class="search-kbd" aria-hidden="true">/</span>
+        </div>
+        <div class="range" id="range" role="group" aria-label="Time range"></div>
+      </div>
+    </div>
+    <main id="view"><p class="empty">Loading your library…</p></main>
+  </div>
+</div>
+<nav class="tabs" id="tabs" aria-label="Sections"></nav>
+<div id="tip" role="tooltip"></div>
+<script src="library.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

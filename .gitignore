@@ -1,0 +1,12 @@
+# Secrets & local state
+.env
+.state/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated data and cached artwork (never commit copyrighted covers or personal history)
+site/library.js
+site/assets/library/
+site/assets/covers/
+site/assets/portraits/
