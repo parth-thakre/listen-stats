@@ -27,6 +27,19 @@ python3 build.py --user YOUR_LB_USERNAME --tz UTC --public
 LASTFM_API_KEY=... python3 build.py --user YOUR_LB_USERNAME --lastfm-user YOUR_LFM_USERNAME --tz America/New_York --public
 ```
 
+### Deploy on GitHub Pages (auto-refreshed)
+
+Fork the repo, enable **Settings → Pages → Source: GitHub Actions**, and configure repository Variables/Secrets (nothing personal needs to be committed to Git):
+
+- **Variables** (*Settings → Secrets and variables → Actions → Variables*):
+  - `LB_USER` — your ListenBrainz username (if unset, GitHub Pages builds the synthetic demo)
+  - `LB_TZ` — optional IANA timezone name (e.g. `America/New_York`, default `UTC`)
+  - `LASTFM_USER` — optional Last.fm username to merge missed scrobbles
+- **Secrets** (*Settings → Secrets and variables → Actions → Secrets*):
+  - `LASTFM_API_KEY` — optional Last.fm API key (required only when `LASTFM_USER` is set)
+
+The included workflow rebuilds in `--public` mode on every push to `main`, manual dispatch, and every 6 hours, caching `.state/` between runs.
+
 ### Self-hosted private mode (with artwork)
 
 For a private server (not redistributed publicly on GitHub Pages):

@@ -1,8 +1,10 @@
-name: Deploy Demo to GitHub Pages
+name: Deploy to GitHub Pages
 
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -25,7 +27,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python3 build.py --demo
+      - name: Install Python dependencies
+        if: vars.LB_USER != ''
+        run: pip install -r requirements.txt
+      - name: Cache API state
+        if: vars.LB_USER != ''
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: lb-state-${{ vars.LB_USER }}-${{ github.run_id }}
+          restore-keys: |
+            lb-state-${{ vars.LB_USER }}-
+      - name: Build live stats (--public)
+        if: vars.LB_USER != ''
+        env:
+          LB_USER: ${{ vars.LB_USER }}
+          LASTFM_USER: ${{ vars.LASTFM_USER }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LB_TZ: ${{ vars.LB_TZ }}
+        run: |
+          args=(--user "$LB_USER" --tz "${LB_TZ:-UTC}" --public)
+          if [ -n "$LASTFM_USER" ] && [ -n "$LASTFM_API_KEY" ]; then
+            args+=(--lastfm-user "$LASTFM_USER")
+          else
+            args+=(--lastfm-user "")
+          fi
+          python3 build.py "${args[@]}"
+      - name: Build synthetic demo
+        if: vars.LB_USER == ''
+        run: python3 build.py --demo
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
