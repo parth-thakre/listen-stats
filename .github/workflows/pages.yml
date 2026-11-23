@@ -30,15 +30,17 @@ jobs:
       - name: Install Python dependencies
         if: vars.LB_USER != ''
         run: pip install -r requirements.txt
-      - name: Cache API state
+      - name: Cache API state and portraits
         if: vars.LB_USER != ''
         uses: actions/cache@v4
         with:
-          path: .state
+          path: |
+            .state
+            site/assets/portraits
           key: lb-state-${{ vars.LB_USER }}-${{ github.run_id }}
           restore-keys: |
             lb-state-${{ vars.LB_USER }}-
-      - name: Build live stats (--public)
+      - name: Build live stats (--public --covers --portraits)
         if: vars.LB_USER != ''
         env:
           LB_USER: ${{ vars.LB_USER }}
@@ -46,7 +48,7 @@ jobs:
           LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
           LB_TZ: ${{ vars.LB_TZ }}
         run: |
-          args=(--user "$LB_USER" --tz "${LB_TZ:-UTC}" --public)
+          args=(--user "$LB_USER" --tz "${LB_TZ:-UTC}" --public --covers --portraits --itunes-lookups 150 --portrait-lookups 45)
           if [ -n "$LASTFM_USER" ] && [ -n "$LASTFM_API_KEY" ]; then
             args+=(--lastfm-user "$LASTFM_USER")
           else
