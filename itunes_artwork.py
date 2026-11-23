@@ -24,6 +24,8 @@ SEARCH_URL = "https://itunes.apple.com/search"
 INDEX_PATH = STATE / "itunes-art.json"
 MISS_TTL = 7 * 86400
 SIZE_RE = re.compile(r"/\d+x\d+bb\.(?:jpg|jpeg|png)$", re.I)
+# Apple's Search API rate limit is ~20 requests/min; stay just under to avoid 429 bursts.
+MIN_INTERVAL = 3.1
 
 
 def _clean_title(title, is_album):
@@ -77,37 +79,32 @@ def _download_webp(session, url, asset_dir, public):
     return str(target.relative_to(public))
 
 
-def _lookup_one(session, term, title, wanted_artists, *, is_album):
-    entity = "album" if is_album else "song"
-    for country in ("IN", "US"):
-        try:
-            resp = session.get(
-                SEARCH_URL,
-                params={"term": term, "media": "music", "entity": entity, "limit": 6, "country": country},
-                timeout=(6, 12),
-            )
-            if resp.status_code == 429:
-                return None, "rate_limited"
-            resp.raise_for_status()
-            results = (resp.json() or {}).get("results") or []
-        except (requests.RequestException, ValueError):
-            return None, "error"
-        for item in results:
-            cand_title = item.get("collectionName" if is_album else "trackName") or ""
-            cand_artist = item.get("artistName") or ""
-            if not _title_matches(title, cand_title, is_album):
-                continue
-            if not _artist_matches(wanted_artists, cand_artist):
-                continue
-            art_url = _upgrade_artwork(item.get("artworkUrl100"))
-            if art_url:
-                return art_url, "hit"
-        time.sleep(0.2)
-    return None, "miss"
+def _parse_year(value):
+    s = str(value or "")[:4]
+    return int(s) if s.isdigit() and 1900 <= int(s) <= 2100 else None
+
+
+def _query_terms(clean, wanted_artists):
+    """Try primary artist first, then additional credited artists (e.g. soundtrack composer vs singer)."""
+    terms = []
+    seen = set()
+    candidates = [a.strip() for a in wanted_artists if isinstance(a, str) and a.strip()]
+    for artist in candidates[:3]:
+        # Split combined strings like "Shail Hada & A. M. Turaz" so iTunes search stays focused.
+        first_name = re.split(r"\s*(?:,|;|&|\bfeat\.?|\bft\.?)\s*", artist, maxsplit=1)[0].strip()
+        if not first_name:
+            continue
+        term = f"{clean} {first_name}".strip()
+        if term.casefold() not in seen:
+            seen.add(term.casefold())
+            terms.append(term)
+    if not terms and clean:
+        terms.append(clean)
+    return terms
 
 
 def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=40, remote_only=False):
-    """Fill missing album and track covers in LIBRARY via verified iTunes lookups."""
+    """Fill missing album and track covers (and missing year/duration) via verified iTunes lookups."""
     public = Path(public) if public else PUBLIC
     asset_dir = public / "assets" / "covers"
     if not remote_only:
@@ -135,84 +132,171 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
             track_to_album.setdefault(t, al)
             album_to_tracks.setdefault(al, set()).add(t)
 
-    stats = {"cached_hits": 0, "fetched_hits": 0, "misses": 0, "attempted": 0, "errors": 0}
+    stats = {"cached_hits": 0, "fetched_hits": 0, "misses": 0, "attempted": 0, "requests": 0, "errors": 0}
     session = requests.Session()
     session.headers["User-Agent"] = "listen-stats/1.0"
+    last_req = 0.0
     rate_limited = False
 
+    def api_search(term, entity, country):
+        nonlocal last_req, rate_limited
+        for attempt in range(2):
+            wait = MIN_INTERVAL - (time.monotonic() - last_req)
+            if wait > 0:
+                time.sleep(wait)
+            last_req = time.monotonic()
+            stats["requests"] += 1
+            try:
+                resp = session.get(
+                    SEARCH_URL,
+                    params={"term": term, "media": "music", "entity": entity, "limit": 8, "country": country},
+                    timeout=(6, 12),
+                )
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        time.sleep(15)
+                        continue
+                    rate_limited = True
+                    return None, "rate_limited"
+                resp.raise_for_status()
+                return (resp.json() or {}).get("results") or [], "ok"
+            except (requests.RequestException, ValueError):
+                return None, "error"
+        return None, "error"
+
+    def lookup(title, wanted_artists, *, is_album):
+        entity = "album" if is_album else "song"
+        clean = _clean_title(title, is_album)
+        terms = _query_terms(clean, wanted_artists)
+        had_error = False
+        for term in terms:
+            for country in ("IN", "US"):
+                if rate_limited:
+                    return None, "rate_limited"
+                results, status = api_search(term, entity, country)
+                if status == "rate_limited":
+                    return None, "rate_limited"
+                if status != "ok":
+                    had_error = True
+                    continue
+                for item in results:
+                    cand_title = item.get("collectionName" if is_album else "trackName") or ""
+                    cand_artist = item.get("artistName") or ""
+                    if not _title_matches(title, cand_title, is_album):
+                        continue
+                    if not _artist_matches(wanted_artists, cand_artist):
+                        continue
+                    art_url = _upgrade_artwork(item.get("artworkUrl100"))
+                    if art_url:
+                        return {
+                            "url": art_url,
+                            "year": _parse_year(item.get("releaseDate")),
+                            "length": item.get("trackTimeMillis") if isinstance(item.get("trackTimeMillis"), int) else None,
+                        }, "hit"
+                # If country=IN had results for this term, try next artist term before falling back to US
+                if country == "IN" and len(terms) > 1 and term != terms[-1]:
+                    break
+        return None, ("error" if had_error else "miss")
+
     def resolve(kind, title, wanted_artists):
-        nonlocal rate_limited
         is_album = kind == "album"
         clean = _clean_title(title, is_album)
         primary_artist = wanted_artists[0] if wanted_artists else ""
-        key = f"{kind}:{norm(clean)}|{norm(primary_artist)}"
+        key = f"v2:{kind}:{norm(clean)}|{norm(primary_artist)}"
         entry = cache.get(key)
+        if not isinstance(entry, dict):
+            # Reuse verified hits from v1 cache keys, but re-check v1 misses with multi-artist queries.
+            legacy = cache.get(f"{kind}:{norm(clean)}|{norm(primary_artist)}")
+            if isinstance(legacy, dict) and (legacy.get("url") or legacy.get("cover")):
+                entry = legacy
         if isinstance(entry, dict):
             if remote_only:
                 url = entry.get("url")
                 if url and is_trusted_cover_url(url):
                     stats["cached_hits"] += 1
-                    return url
+                    return url, entry.get("year"), entry.get("length")
                 if not url and now - entry.get("checked_at", 0) < MISS_TTL:
-                    return None
+                    return None, None, None
             else:
                 cover = entry.get("cover")
                 if cover and (public / cover).is_file():
                     stats["cached_hits"] += 1
-                    return cover
+                    return cover, entry.get("year"), entry.get("length")
                 if not cover and now - entry.get("checked_at", 0) < MISS_TTL:
-                    return None
+                    return None, None, None
         if rate_limited or (max_lookups is not None and stats["attempted"] >= max_lookups):
-            return None
+            return None, None, None
         if not clean:
-            return None
+            return None, None, None
         stats["attempted"] += 1
-        term = f"{clean} {primary_artist}".strip()
-        art_url, status = _lookup_one(session, term, title, wanted_artists, is_album=is_album)
-        if status == "rate_limited":
-            rate_limited = True
+        hit, status = lookup(title, wanted_artists, is_album=is_album)
+        if status == "rate_limited" or status == "error":
             stats["errors"] += 1
-            return None
-        if status == "error":
-            stats["errors"] += 1
-            return None
-        if art_url:
+            return None, None, None
+        if hit:
+            art_url = hit["url"]
             if remote_only:
-                cache[key] = {"url": art_url, "checked_at": now}
+                cache[key] = {"url": art_url, "year": hit["year"], "length": hit["length"], "checked_at": now}
                 stats["fetched_hits"] += 1
-                return art_url
+                return art_url, hit["year"], hit["length"]
             try:
                 rel = _download_webp(session, art_url, asset_dir, public)
-                cache[key] = {"cover": rel, "url": art_url, "checked_at": now}
+                cache[key] = {
+                    "cover": rel, "url": art_url, "year": hit["year"], "length": hit["length"], "checked_at": now
+                }
                 stats["fetched_hits"] += 1
-                return rel
+                return rel, hit["year"], hit["length"]
             except (requests.RequestException, OSError, ValueError):
                 stats["errors"] += 1
-                return None
+                return None, None, None
         cache[key] = {"cover": None, "url": None, "checked_at": now}
         stats["misses"] += 1
-        return None
+        return None, None, None
+
+    def apply_album(i):
+        wanted = [artists[a][0] for a in albums[i][1] if a < len(artists)]
+        cover, year, _ = resolve("album", albums[i][0], wanted)
+        if cover:
+            albums[i][2] = cover
+            for t in album_to_tracks.get(i, ()):
+                if not tracks[t][3]:
+                    tracks[t][3] = cover
+                if year and not tracks[t][5]:
+                    tracks[t][5] = year
+
+    def apply_track(i):
+        wanted = [artists[a][0] for a in tracks[i][2] if a < len(artists)]
+        if not wanted and tracks[i][1]:
+            wanted = [tracks[i][1]]
+        cover, year, length = resolve("track", tracks[i][0], wanted)
+        if cover:
+            tracks[i][3] = cover
+            if length and not tracks[i][4]:
+                tracks[i][4] = length
+            if year and not tracks[i][5]:
+                tracks[i][5] = year
+            al = track_to_album.get(i)
+            if al is not None and not albums[al][2]:
+                albums[al][2] = cover
 
     try:
+        # Prioritize multi-play albums and tracks first so the most visible pages always get art.
         missing_albums = sorted([i for i, a in enumerate(albums) if not a[2]], key=lambda i: -al_plays.get(i, 0))
-        for i in missing_albums:
-            wanted = [artists[a][0] for a in albums[i][1] if a < len(artists)]
-            cover = resolve("album", albums[i][0], wanted)
-            if cover:
-                albums[i][2] = cover
-
-        for t, al in track_to_album.items():
-            if not tracks[t][3] and albums[al][2]:
-                tracks[t][3] = albums[al][2]
+        for i in [i for i in missing_albums if al_plays.get(i, 0) >= 2]:
+            apply_album(i)
 
         missing_tracks = sorted([i for i, t in enumerate(tracks) if not t[3]], key=lambda i: -tr_plays.get(i, 0))
-        for i in missing_tracks:
-            wanted = [artists[a][0] for a in tracks[i][2] if a < len(artists)]
-            if not wanted and tracks[i][1]:
-                wanted = [tracks[i][1]]
-            cover = resolve("track", tracks[i][0], wanted)
-            if cover:
-                tracks[i][3] = cover
+        for i in [i for i in missing_tracks if tr_plays.get(i, 0) >= 2]:
+            if not tracks[i][3]:
+                apply_track(i)
+
+        for i in [i for i in missing_albums if al_plays.get(i, 0) < 2]:
+            if not albums[i][2]:
+                apply_album(i)
+
+        for i in [i for i in missing_tracks if tr_plays.get(i, 0) < 2]:
+            if not tracks[i][3]:
+                apply_track(i)
 
         for al, tset in album_to_tracks.items():
             if not albums[al][2]:

@@ -48,7 +48,7 @@ jobs:
           LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
           LB_TZ: ${{ vars.LB_TZ }}
         run: |
-          args=(--user "$LB_USER" --tz "${LB_TZ:-UTC}" --public --covers --portraits --itunes-lookups 150 --portrait-lookups 45)
+          args=(--user "$LB_USER" --tz "${LB_TZ:-UTC}" --public --covers --portraits --itunes-lookups 45 --portrait-lookups 45)
           if [ -n "$LASTFM_USER" ] && [ -n "$LASTFM_API_KEY" ]; then
             args+=(--lastfm-user "$LASTFM_USER")
           else

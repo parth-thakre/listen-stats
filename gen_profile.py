@@ -158,9 +158,12 @@ def prepare(report, metadata):
         l['_credit'] = credited(l)
         l['_a'] = ', '.join(name for name, _ in l['_credit'][:3]) if len(l['_credit']) > 1 else l['_credit'][0][0]
         l['_tr'] = l['track_metadata'].get('track_name', '?')
+        info = l['track_metadata'].get('additional_info') or {}
         l['_c'] = cover_of(l, meta)
         l['_m'] = minutes(l, meta)
-        l['_len'] = (meta or {}).get('length')
+        l['_len'] = (meta or {}).get('length') or info.get('duration_ms') or (
+            int(info['duration'] * 1000) if info.get('duration') else None
+        )
     return listens
 
 
