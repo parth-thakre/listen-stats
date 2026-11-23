@@ -28,10 +28,30 @@ SIZE_RE = re.compile(r"/\d+x\d+bb\.(?:jpg|jpeg|png)$", re.I)
 MIN_INTERVAL = 3.1
 
 
+SITE_TAG_RE = re.compile(r"\s*(?:[(-]\s*)?(?:www\.)?[a-z0-9-]+\.(?:com|pk|in|net|band|org)\)?", re.I)
+TRACK_EXTRA_RE = re.compile(r"\s*(?:\(home recording\)|\s-\s(?:studio|live\b.*|from\s+.*|i-popstar.*|\d{4}))\s*$", re.I)
+
+
 def _clean_title(title, is_album):
     stripped = (ALBUM_SUFFIX if is_album else TRACK_SUFFIX).sub("", str(title or ""))
-    stripped = re.sub(r"\s*(?:[(-]\s*)?(?:www\.)?[a-z0-9-]+\.(?:com|pk|in|net)\)?", "", stripped, flags=re.I)
-    return stripped.strip()
+    stripped = SITE_TAG_RE.sub("", stripped)
+    if not is_album:
+        stripped = TRACK_EXTRA_RE.sub("", stripped)
+    else:
+        stripped = re.sub(r"\s*-\s*\d{4}\s*$", "", stripped)
+    return stripped.strip(" -")
+
+
+def _clean_artists(wanted_artists):
+    out = []
+    for artist in wanted_artists or ():
+        if not isinstance(artist, str):
+            continue
+        for piece in re.split(r"\s*(?:,|;|/|&|\bfeat\.?|\bft\.?)\s*", artist):
+            piece = SITE_TAG_RE.sub("", piece).strip(" ,.-")
+            if piece and piece not in out:
+                out.append(piece)
+    return out
 
 
 def _title_matches(wanted, candidate, is_album):
@@ -45,12 +65,13 @@ def _title_matches(wanted, candidate, is_album):
     return len(short) >= 5 and short in long_ and len(short) / len(long_) >= 0.45
 
 
-def _artist_matches(wanted_artists, candidate_artist):
+def _artist_matches(wanted_artists, candidate_artist, *, wanted_album=None, candidate_album=None):
+    cleaned = _clean_artists(wanted_artists)
+    if not cleaned:
+        return bool(wanted_album and candidate_album and _title_matches(wanted_album, candidate_album, True))
     if not candidate_artist:
         return False
-    if not wanted_artists:
-        return True
-    return any(same_artist(w, candidate_artist) for w in wanted_artists if w)
+    return any(same_artist(w, candidate_artist) for w in cleaned)
 
 
 def _upgrade_artwork(url):
@@ -84,20 +105,19 @@ def _parse_year(value):
     return int(s) if s.isdigit() and 1900 <= int(s) <= 2100 else None
 
 
-def _query_terms(clean, wanted_artists):
+def _query_terms(clean, wanted_artists, *, album_hint=None):
     """Try primary artist first, then additional credited artists (e.g. soundtrack composer vs singer)."""
     terms = []
     seen = set()
-    candidates = [a.strip() for a in wanted_artists if isinstance(a, str) and a.strip()]
-    for artist in candidates[:3]:
-        # Split combined strings like "Shail Hada & A. M. Turaz" so iTunes search stays focused.
-        first_name = re.split(r"\s*(?:,|;|&|\bfeat\.?|\bft\.?)\s*", artist, maxsplit=1)[0].strip()
-        if not first_name:
-            continue
-        term = f"{clean} {first_name}".strip()
+    for artist in _clean_artists(wanted_artists)[:3]:
+        term = f"{clean} {artist}".strip()
         if term.casefold() not in seen:
             seen.add(term.casefold())
             terms.append(term)
+    if not terms and album_hint:
+        ac = _clean_title(album_hint, True)
+        if ac:
+            terms.append(f"{clean} {ac}".strip())
     if not terms and clean:
         terms.append(clean)
     return terms
@@ -164,10 +184,10 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
                 return None, "error"
         return None, "error"
 
-    def lookup(title, wanted_artists, *, is_album):
+    def lookup(title, wanted_artists, *, is_album, album_hint=None):
         entity = "album" if is_album else "song"
         clean = _clean_title(title, is_album)
-        terms = _query_terms(clean, wanted_artists)
+        terms = _query_terms(clean, wanted_artists, album_hint=album_hint)
         had_error = False
         for term in terms:
             for country in ("IN", "US"):
@@ -182,9 +202,10 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
                 for item in results:
                     cand_title = item.get("collectionName" if is_album else "trackName") or ""
                     cand_artist = item.get("artistName") or ""
+                    cand_album = item.get("collectionName") or ""
                     if not _title_matches(title, cand_title, is_album):
                         continue
-                    if not _artist_matches(wanted_artists, cand_artist):
+                    if not _artist_matches(wanted_artists, cand_artist, wanted_album=album_hint, candidate_album=cand_album):
                         continue
                     art_url = _upgrade_artwork(item.get("artworkUrl100"))
                     if art_url:
@@ -198,17 +219,23 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
                     break
         return None, ("error" if had_error else "miss")
 
-    def resolve(kind, title, wanted_artists):
+    def resolve(kind, title, wanted_artists, *, album_hint=None):
         is_album = kind == "album"
         clean = _clean_title(title, is_album)
-        primary_artist = wanted_artists[0] if wanted_artists else ""
-        key = f"v2:{kind}:{norm(clean)}|{norm(primary_artist)}"
+        cleaned_artists = _clean_artists(wanted_artists)
+        primary_artist = cleaned_artists[0] if cleaned_artists else _clean_title(album_hint or "", True)
+        key = f"v3:{kind}:{norm(clean)}|{norm(primary_artist)}"
         entry = cache.get(key)
         if not isinstance(entry, dict):
-            # Reuse verified hits from v1 cache keys, but re-check v1 misses with multi-artist queries.
-            legacy = cache.get(f"{kind}:{norm(clean)}|{norm(primary_artist)}")
-            if isinstance(legacy, dict) and (legacy.get("url") or legacy.get("cover")):
-                entry = legacy
+            # Reuse verified hits from older cache keys, but re-check misses with improved cleaning.
+            for legacy_key in (
+                f"v2:{kind}:{norm(clean)}|{norm(wanted_artists[0] if wanted_artists else '')}",
+                f"{kind}:{norm(clean)}|{norm(wanted_artists[0] if wanted_artists else '')}",
+            ):
+                legacy = cache.get(legacy_key)
+                if isinstance(legacy, dict) and (legacy.get("url") or legacy.get("cover")):
+                    entry = legacy
+                    break
         if isinstance(entry, dict):
             if remote_only:
                 url = entry.get("url")
@@ -229,7 +256,7 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
         if not clean:
             return None, None, None
         stats["attempted"] += 1
-        hit, status = lookup(title, wanted_artists, is_album=is_album)
+        hit, status = lookup(title, wanted_artists, is_album=is_album, album_hint=album_hint)
         if status == "rate_limited" or status == "error":
             stats["errors"] += 1
             return None, None, None
@@ -268,14 +295,15 @@ def enrich_library_itunes(library, *, public=None, index_path=None, max_lookups=
         wanted = [artists[a][0] for a in tracks[i][2] if a < len(artists)]
         if not wanted and tracks[i][1]:
             wanted = [tracks[i][1]]
-        cover, year, length = resolve("track", tracks[i][0], wanted)
+        al = track_to_album.get(i)
+        album_hint = albums[al][0] if al is not None else None
+        cover, year, length = resolve("track", tracks[i][0], wanted, album_hint=album_hint)
         if cover:
             tracks[i][3] = cover
             if length and not tracks[i][4]:
                 tracks[i][4] = length
             if year and not tracks[i][5]:
                 tracks[i][5] = year
-            al = track_to_album.get(i)
             if al is not None and not albums[al][2]:
                 albums[al][2] = cover
 
